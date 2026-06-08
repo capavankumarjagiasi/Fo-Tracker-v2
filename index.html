@@ -431,7 +431,7 @@ body { font-family:'Segoe UI',system-ui,sans-serif; background:#1a1a2e; color:#e
 const CONFIG = {
   // PRIMARY: GitHub raw URL (RECOMMENDED - same domain, no CORS, no API keys)
   // Replace with your actual raw GitHub URL after pushing JSON to repo
-  githubRawUrl: 'https://raw.githubusercontent.com/capavankumarjagiasi/Futures-Tracker/main/fo_snapshot.json',
+  githubRawUrl: 'https://raw.githubusercontent.com/capavankumarjagiasi/Fo-Tracker-v2/main/fo_snapshot.json',
   
   // FALLBACK: jsonbin.io (if you prefer external hosting)
   // Replace YOUR_BIN_ID with your actual bin ID
@@ -451,6 +451,8 @@ let appData = null;
 let currentTab = 'dashboard';
 let dashboardFilter = 'all';
 
+const CACHE_VERSION = 'v2'; // bump this to bust stale cache
+
 // ============================================
 // DATA LOADING - NO GOOGLE DRIVE / NO OAUTH
 // ============================================
@@ -464,10 +466,10 @@ async function loadData() {
     let source = '';
     let errors = [];
 
-    // 1. Try localStorage cache first for instant display
+    // 1. Try localStorage cache first (only if same version)
     const cached = localStorage.getItem('fo_snapshot_cache');
-    const cachedTime = localStorage.getItem('fo_snapshot_time');
-    if (cached) {
+    const cachedVer = localStorage.getItem('fo_snapshot_ver');
+    if (cached && cachedVer === CACHE_VERSION) {
       try {
         data = JSON.parse(cached);
         source = 'cache';
@@ -487,20 +489,20 @@ async function loadData() {
     }
 
     for (const src of urlsToTry) {
-      if (data && source === 'live') break; // Already got live data
+      if (data && source === 'live') break;
       try {
         console.log('Trying:', src.name, src.url);
         const resp = await fetch(src.url, { 
           cache: 'no-store',
-          headers: src.name === 'jsonbin' ? { 'X-Master-Key': '' } : {} // Add jsonbin key if needed
+          headers: src.name === 'jsonbin' ? { 'X-Master-Key': '' } : {}
         });
         if (resp.ok) {
           let raw = await resp.json();
-          // jsonbin.io wraps data in { record: {...}, metadata: {...} }
           if (src.name === 'jsonbin' && raw.record) raw = raw.record;
           data = raw;
           source = 'live';
           localStorage.setItem('fo_snapshot_cache', JSON.stringify(data));
+          localStorage.setItem('fo_snapshot_ver', CACHE_VERSION);
           localStorage.setItem('fo_snapshot_time', new Date().toISOString());
           console.log('Loaded from:', src.name);
           break;
@@ -549,12 +551,19 @@ async function loadData() {
 // DATA PROCESSING
 // ============================================
 function processData(raw) {
-  const tracker = raw.futures_tracker || [];
+  // Support both v1.0 (futures_tracker = near only) and v2.0 (has near_month)
+  const nearMonth  = raw.near_month  || raw.futures_tracker || [];
+  const midMonth   = raw.mid_month   || [];
+  const farMonth   = raw.far_month   || [];
+  const allExpiry  = raw.futures_tracker || nearMonth;
+  const rollover   = raw.rollover    || [];
 
-  // Compute signal counts from futures_tracker (NOT signal_breakdown which is limited)
+  // tracker = near month for dashboard/OI/basis (backward compat)
+  const tracker = nearMonth;
+
+  // Compute signal counts from near month
   const signalCounts = { LB:0, SB:0, LU:0, SC:0 };
-  const signalItems = { LB:[], SB:[], LU:[], SC:[] };
-
+  const signalItems  = { LB:[], SB:[], LU:[], SC:[] };
   tracker.forEach(item => {
     const sig = item.signal;
     if (signalCounts.hasOwnProperty(sig)) {
@@ -575,7 +584,7 @@ function processData(raw) {
     else basisCats.dp.push(item);
   });
 
-  // Extract alerts
+  // Extract alerts from near month
   const alerts = [];
   tracker.forEach(item => {
     if (item.alerts && item.alerts.trim()) {
@@ -583,7 +592,6 @@ function processData(raw) {
       alertList.forEach(a => alerts.push({ symbol: item.symbol, alert: a, signal: item.signal }));
     }
   });
-  // Sort: Hi Disc first, then by symbol
   const alertPriority = { '🔻Hi Disc': 0, '⚡OI Spike': 1, '🚀Squeeze': 2, '⚠Bull Trap': 3, '🔄Rev↓': 4, '🔄Rev↑': 5 };
   alerts.sort((a, b) => {
     const pa = alertPriority[a.alert] ?? 99;
@@ -591,20 +599,29 @@ function processData(raw) {
     return pa - pb || a.symbol.localeCompare(b.symbol);
   });
 
-  // Ban list - from futures_tracker where ban_status is 'banned'
   const banList = tracker.filter(i => i.ban_status === 'banned');
 
+  // Symbol lookup across ALL expiries for detail modal
+  const allSymbolMap = {};
+  allExpiry.forEach(i => { allSymbolMap[i.symbol] = i; });
+
   return {
-    raw,
-    meta: raw.meta || {},
-    tracker,
+    meta:        raw.meta || {},
+    tracker,           // near month — used by dashboard, OI, basis
+    nearMonth,
+    midMonth,
+    farMonth,
+    allExpiry,
+    rollover,
     signalCounts,
     signalItems,
     basisCats,
     basisSummary: raw.basis_summary || [],
-    oiMovers: raw.oi_movers || { gainers:[], losers:[] },
+    oiMovers:    raw.oi_movers || { gainers:[], losers:[] },
     alerts,
-    banList
+    banList,
+    allSymbolMap,
+    expiries:    raw.meta?.expiries || {}
   };
 }
 
@@ -774,32 +791,66 @@ function renderDashboard(el) {
   initTableSorting();
 }
 
+// ── Tracker state ────────────────────────────────────────────────────────────
+let trackerExpiry  = 'near';   // near | mid | nearmid | all
+
+function setTrackerExpiry(v) {
+  trackerExpiry = v;
+  document.querySelectorAll('#trackerExpiryFilter .filter-pill').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('data-val') === v);
+  });
+  renderTracker(document.getElementById('content'));
+}
+
+function getTrackerRows() {
+  switch(trackerExpiry) {
+    case 'near':    return appData.nearMonth;
+    case 'mid':     return appData.midMonth;
+    case 'nearmid': return [...appData.nearMonth, ...appData.midMonth];
+    case 'all':     return appData.allExpiry;
+    default:        return appData.nearMonth;
+  }
+}
+
 function renderTracker(el) {
+  const rows = getTrackerRows();
+  const expiryLabel = { near: appData.expiries.near || 'Near', mid: appData.expiries.mid || 'Mid',
+                        nearmid: 'Near + Mid', all: 'All' }[trackerExpiry] || '';
   let html = `
     <div class="refresh-bar">
       <button class="refresh-btn" onclick="loadData()">🔄 Refresh</button>
-      <span class="source-info">${appData.tracker.length} symbols</span>
+      <span class="source-info">${rows.length} contracts · ${expiryLabel}</span>
     </div>
     <input type="text" class="search-box" id="searchBox" placeholder="🔍 Search symbol..." oninput="filterTracker()">
+
+    <!-- Expiry Filter -->
+    <div class="filter-pills" id="trackerExpiryFilter">
+      <span style="font-size:12px;color:#888;margin-right:4px;">Expiry:</span>
+      <button class="filter-pill ${trackerExpiry==='near'?'active':''}" data-val="near" onclick="setTrackerExpiry('near')">Near (${appData.nearMonth.length})</button>
+      <button class="filter-pill ${trackerExpiry==='mid'?'active':''}" data-val="mid" onclick="setTrackerExpiry('mid')">Mid (${appData.midMonth.length})</button>
+      <button class="filter-pill ${trackerExpiry==='nearmid'?'active':''}" data-val="nearmid" onclick="setTrackerExpiry('nearmid')">Near+Mid (${appData.nearMonth.length + appData.midMonth.length})</button>
+      <button class="filter-pill ${trackerExpiry==='all'?'active':''}" data-val="all" onclick="setTrackerExpiry('all')">All (${appData.allExpiry.length})</button>
+    </div>
 
     <!-- Signal Filter -->
     <div class="filter-pills" id="signalFilter">
       <span style="font-size:12px;color:#888;margin-right:4px;">Signal:</span>
       <button class="filter-pill active" onclick="setTrackerSignal('all')">All</button>
-      <button class="filter-pill" onclick="setTrackerSignal('LB')">LB</button>
-      <button class="filter-pill" onclick="setTrackerSignal('SB')">SB</button>
-      <button class="filter-pill" onclick="setTrackerSignal('LU')">LU</button>
-      <button class="filter-pill" onclick="setTrackerSignal('SC')">SC</button>
+      <button class="filter-pill" onclick="setTrackerSignal('LB')">🔥 LB</button>
+      <button class="filter-pill" onclick="setTrackerSignal('SB')">🐻 SB</button>
+      <button class="filter-pill" onclick="setTrackerSignal('LU')">💧 LU</button>
+      <button class="filter-pill" onclick="setTrackerSignal('SC')">⚡ SC</button>
     </div>
 
     <!-- Pattern Filter -->
     <div class="filter-pills" id="patternFilter">
       <span style="font-size:12px;color:#888;margin-right:4px;">Pattern:</span>
       <button class="filter-pill active" onclick="setTrackerPattern('all')">All</button>
-      <button class="filter-pill" onclick="setTrackerPattern('LB')">LB</button>
-      <button class="filter-pill" onclick="setTrackerPattern('SB')">SB</button>
-      <button class="filter-pill" onclick="setTrackerPattern('LU')">LU</button>
-      <button class="filter-pill" onclick="setTrackerPattern('SC')">SC</button>
+      <button class="filter-pill" onclick="setTrackerPattern('Strong LB')">🔥 Strong LB</button>
+      <button class="filter-pill" onclick="setTrackerPattern('Strong SB')">🐻 Strong SB</button>
+      <button class="filter-pill" onclick="setTrackerPattern('Bull Trap')">⚠ Bull Trap</button>
+      <button class="filter-pill" onclick="setTrackerPattern('Squeeze')">🚀 Squeeze</button>
+      <button class="filter-pill" onclick="setTrackerPattern('Recovery')">🔄 Recovery</button>
     </div>
 
     <!-- Alert Filter -->
@@ -813,8 +864,7 @@ function renderTracker(el) {
       <button class="filter-pill" onclick="setTrackerAlert('Rev')">🔄Reversal</button>
     </div>
 
-
-    <!-- Discount/Premium Filter (Pills) -->
+    <!-- Basis Filter -->
     <div class="filter-pills" id="basisFilter">
       <span style="font-size:12px;color:#888;margin-right:4px;">Basis:</span>
       <button class="filter-pill active" onclick="setTrackerBasis('all')">All</button>
@@ -827,27 +877,39 @@ function renderTracker(el) {
 
     <div class="table-scroll">
       <div class="table-wrap">
-        <div class="table-header" style="grid-template-columns: 100px 70px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 900px;">
-          <span>Symbol</span><span>Signal</span><span>Conv★</span><span>Basis%</span><span>Spot</span><span>LTP</span><span>OI / Chg</span><span>5d OI%</span><span>Pattern</span>
+        <div class="table-header" style="grid-template-columns: 100px 55px 55px 70px 80px 90px 90px 110px 90px 1fr; min-width: 920px;">
+          <span>Symbol</span><span>Expiry</span><span>Signal</span><span>Conv★</span><span>Basis%</span><span>Spot</span><span>LTP</span><span>OI / Chg</span><span>5d OI%</span><span>Pattern / Alerts</span>
         </div>
         <div id="trackerRows">
   `;
 
-  appData.tracker.forEach(item => {
+  rows.forEach(item => {
     const basisClass = (item.basis_pct || 0) >= 0 ? 'basis-pos' : 'basis-neg';
     const oiClass = (item.oi_chg || 0) >= 0 ? 'oi-up' : 'oi-down';
     const oiSparkSvg = renderSparkline(item.oi_history || [], item.oi_chg >= 0 ? '#4caf50' : '#ef5350');
+    const expiryShort = item.expiry ? item.expiry.replace('-2026','') : '—';
+    const isNear = item.expiry_rank === 1;
+    const expiryColor = isNear ? '#4fc3f7' : item.expiry_rank === 2 ? '#ffa726' : '#aaa';
     html += `
-          <div class="table-row tracker-row" data-symbol="${item.symbol.toLowerCase()}" data-signal="${item.signal}" data-alerts="${(item.alerts || '').toLowerCase()}" data-pattern="${(item.pattern || '').toLowerCase()}" data-basis="${item.basis_pct !== null ? item.basis_pct : 0}" data-basiscat="${item.basis_pct !== null ? (item.basis_pct < -1 ? 'dd' : item.basis_pct < 0 ? 'd' : item.basis_pct === 0 ? 'p' : item.basis_pct <= 1 ? 'pm' : 'dp') : 'p'}" style="grid-template-columns: 100px 70px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 900px; cursor:pointer;" onclick="showDetail('${item.symbol}')">
-            <span class="col-symbol">${item.symbol}</span>
-            <span class="col-signal signal-${item.signal}">${item.signal}</span>
-            <span style="font-weight:700;color:#f0c040;text-align:center;">${item.conv_score !== null ? item.conv_score : '-'}</span>
+          <div class="table-row tracker-row"
+            data-symbol="${item.symbol.toLowerCase()}"
+            data-signal="${item.signal}"
+            data-alerts="${(item.alerts || '').toLowerCase()}"
+            data-pattern="${(item.pattern || '').toLowerCase()}"
+            data-basis="${item.basis_pct !== null ? item.basis_pct : 0}"
+            data-basiscat="${item.basis_pct !== null ? (item.basis_pct < -1 ? 'dd' : item.basis_pct < 0 ? 'd' : item.basis_pct === 0 ? 'p' : item.basis_pct <= 1 ? 'pm' : 'dp') : 'p'}"
+            style="grid-template-columns: 100px 55px 55px 70px 80px 90px 90px 110px 90px 1fr; min-width: 920px; cursor:pointer;"
+            onclick="showDetail('${item.symbol}')">
+            <span class="col-symbol">${item.ban_status==='banned'?'🔴 ':''}${item.symbol}</span>
+            <span style="font-size:10px;color:${expiryColor};font-weight:600;">${expiryShort}</span>
+            <span class="col-signal signal-${item.signal}">${item.signal || '—'}</span>
+            <span style="font-weight:700;color:#f0c040;text-align:center;">${item.conv_score || '-'}</span>
             <span class="col-basis ${basisClass}">${item.basis_pct !== null ? item.basis_pct.toFixed(2) : '-'}</span>
-            <span>${item.spot !== null ? item.spot.toFixed(1) : '-'}</span>
-            <span>${item.ltp !== null ? item.ltp.toFixed(1) : '-'}</span>
-            <span class="col-oi ${oiClass}">${formatNumber(item.oi)}<br><span class="oi-chg">${item.oi_chg>=0?'▲':'▼'} ${formatNumber(Math.abs(item.oi_chg))}</span></span>
-            <span>${item.oi_5d_pct !== null ? item.oi_5d_pct.toFixed(1)+'%' : '-'}</span>
-            <span class="col-alerts">${item.pattern || '-'}</span>
+            <span>${item.spot ? item.spot.toFixed(1) : '-'}</span>
+            <span>${item.ltp ? item.ltp.toFixed(1) : '-'}</span>
+            <span class="col-oi ${oiClass}">${formatNumber(item.oi)}<br><span class="oi-chg">${(item.oi_chg||0)>=0?'▲':'▼'} ${formatNumber(Math.abs(item.oi_chg||0))}</span></span>
+            <span>${item.oi_5d_pct ? item.oi_5d_pct.toFixed(1)+'%' : '-'}</span>
+            <span class="col-alerts">${item.pattern || '—'}${item.alerts ? '<br><span style="font-size:10px;color:#aaa;">'+item.alerts+'</span>' : ''}</span>
           </div>
         `;
   });
@@ -1118,38 +1180,75 @@ function renderSparkline(data, color) {
 // ============================================
 // MID MONTH TAB
 // ============================================
+let midSignal = 'all', midSearch = '';
+
+function setMidSignal(v) {
+  midSignal = v;
+  document.querySelectorAll('#midSignalFilter .filter-pill').forEach(b =>
+    b.classList.toggle('active', b.getAttribute('data-val') === v));
+  applyMidFilters();
+}
+
+function applyMidFilters() {
+  document.querySelectorAll('.mid-row').forEach(row => {
+    const sig  = row.getAttribute('data-signal');
+    const sym  = row.getAttribute('data-symbol');
+    let show = true;
+    if (midSignal !== 'all' && sig !== midSignal) show = false;
+    if (midSearch && !sym.includes(midSearch)) show = false;
+    row.style.display = show ? '' : 'none';
+  });
+}
+
 function renderMidMonth(el) {
-  const midData = (appData.raw && appData.raw.mid_month) ? appData.raw.mid_month : [];
+  const midData = appData.midMonth || [];
+  const exp = appData.expiries.mid || '—';
   let html = `
     <div class="refresh-bar">
       <button class="refresh-btn" onclick="loadData()">🔄 Refresh</button>
-      <span class="source-info">Mid Month — ${midData.length} contracts</span>
+      <span class="source-info">Mid Month · ${exp} · ${midData.length} contracts</span>
     </div>
+    <input type="text" class="search-box" id="midSearchBox" placeholder="🔍 Search symbol..."
+      oninput="midSearch=this.value.toLowerCase(); applyMidFilters()">
+
+    <div class="filter-pills" id="midSignalFilter">
+      <span style="font-size:12px;color:#888;margin-right:4px;">Signal:</span>
+      <button class="filter-pill active" data-val="all" onclick="setMidSignal('all')">All</button>
+      <button class="filter-pill" data-val="LB" onclick="setMidSignal('LB')">🔥 LB</button>
+      <button class="filter-pill" data-val="SB" onclick="setMidSignal('SB')">🐻 SB</button>
+      <button class="filter-pill" data-val="LU" onclick="setMidSignal('LU')">💧 LU</button>
+      <button class="filter-pill" data-val="SC" onclick="setMidSignal('SC')">⚡ SC</button>
+    </div>
+
     <div class="table-scroll">
       <div class="table-wrap">
-        <div class="table-header" style="grid-template-columns: 100px 70px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 900px;">
-          <span>Symbol</span><span>Signal</span><span>Conv★</span><span>Basis%</span><span>Spot</span><span>LTP</span><span>OI / Chg</span><span>5d OI%</span><span>OI Trend</span><span>Pattern / Alerts</span>
+        <div class="table-header" style="grid-template-columns: 110px 55px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 920px;">
+          <span>Symbol</span><span>Type</span><span>Signal</span><span>Basis%</span><span>Spot</span><span>LTP</span><span>OI / Chg</span><span>5d OI%</span><span>Conv★</span><span>Pattern / Alerts</span>
         </div>
   `;
+
   if (midData.length === 0) {
-    html += `<div class="empty" style="padding:20px;">No mid month data. Ensure mid_month is in the snapshot JSON.</div>`;
+    html += `<div class="empty" style="padding:20px;">No mid month data in snapshot.</div>`;
   } else {
     midData.forEach(item => {
       const basisClass = (item.basis_pct || 0) >= 0 ? 'basis-pos' : 'basis-neg';
-      const oiClass = (item.oi_chg || 0) >= 0 ? 'oi-up' : 'oi-down';
-      const oiSparkSvg = renderSparkline(item.oi_history || [], item.oi_chg >= 0 ? '#4caf50' : '#ef5350');
+      const oiClass    = (item.oi_chg || 0) >= 0 ? 'oi-up' : 'oi-down';
       html += `
-        <div class="table-row" style="grid-template-columns: 100px 70px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 900px; cursor:pointer;" onclick="showDetail('${item.symbol}')">
-          <span class="col-symbol">${item.symbol}</span>
+        <div class="table-row mid-row"
+          data-symbol="${item.symbol.toLowerCase()}"
+          data-signal="${item.signal || ''}"
+          style="grid-template-columns: 110px 55px 55px 80px 90px 90px 110px 90px 80px 1fr; min-width: 920px; cursor:pointer;"
+          onclick="showDetail('${item.symbol}')">
+          <span class="col-symbol">${item.ban_status==='banned'?'🔴 ':''}${item.symbol}</span>
+          <span style="color:#888;font-size:11px;">${item.type}</span>
           <span class="col-signal signal-${item.signal}">${item.signal || '—'}</span>
-          <span style="font-weight:700;color:#f0c040;text-align:center;">${item.conv_score || '-'}</span>
           <span class="col-basis ${basisClass}">${item.basis_pct !== null ? item.basis_pct.toFixed(2) : '-'}</span>
           <span>${item.spot ? item.spot.toFixed(1) : '-'}</span>
           <span>${item.ltp ? item.ltp.toFixed(1) : '-'}</span>
-          <span class="col-oi ${oiClass}">${formatNumber(item.oi)}<br><span class="oi-chg">${item.oi_chg>=0?'▲':'▼'} ${formatNumber(Math.abs(item.oi_chg))}</span></span>
+          <span class="col-oi ${oiClass}">${formatNumber(item.oi)}<br><span class="oi-chg">${(item.oi_chg||0)>=0?'▲':'▼'} ${formatNumber(Math.abs(item.oi_chg||0))}</span></span>
           <span>${item.oi_5d_pct ? item.oi_5d_pct.toFixed(1)+'%' : '-'}</span>
-          <span>${oiSparkSvg}</span>
-          <span class="col-alerts">${item.pattern || '—'}${item.alerts ? ' | '+item.alerts : ''}</span>
+          <span style="font-weight:700;color:#f0c040;">${item.conv_score || '-'}</span>
+          <span class="col-alerts">${item.pattern || '—'}${item.alerts ? '<br><span style="font-size:10px;color:#aaa;">'+item.alerts+'</span>' : ''}</span>
         </div>
       `;
     });
@@ -1162,46 +1261,111 @@ function renderMidMonth(el) {
 // ============================================
 // ROLLOVER TAB
 // ============================================
+let rvSort = 'rolled_pct';
+
+function setRvSort(v) {
+  rvSort = v;
+  document.querySelectorAll('#rvSortFilter .filter-pill').forEach(b =>
+    b.classList.toggle('active', b.getAttribute('data-val') === v));
+  renderRollover(document.getElementById('content'));
+}
+
 function renderRollover(el) {
-  const rvData = (appData.raw && appData.raw.rollover) ? appData.raw.rollover : [];
+  const expiries = appData.expiries;
+  let rvData = [...(appData.rollover || [])];
+
+  // Sort
+  const sortKeys = {
+    rolled_pct: { key: 'rolled_pct', desc: true },
+    near_oi:    { key: 'near_oi',    desc: true },
+    mid_oi:     { key: 'mid_oi',     desc: true },
+    roll_cost:  { key: 'roll_cost_pct', desc: true },
+    symbol:     { key: 'symbol',     desc: false },
+  };
+  const { key: sk, desc: sd } = sortKeys[rvSort] || sortKeys.rolled_pct;
+  rvData.sort((a, b) => {
+    const av = a[sk], bv = b[sk];
+    if (typeof av === 'string') return sd ? bv.localeCompare(av) : av.localeCompare(bv);
+    return sd ? (bv || 0) - (av || 0) : (av || 0) - (bv || 0);
+  });
+
+  // Summary stats
+  const high = rvData.filter(r => r.rolled_pct > 60).length;
+  const low  = rvData.filter(r => r.rolled_pct < 20 && r.mid_oi > 0).length;
+  const avgRolled = rvData.length ? (rvData.reduce((s,r) => s + r.rolled_pct, 0) / rvData.length).toFixed(1) : 0;
+
   let html = `
     <div class="refresh-bar">
       <button class="refresh-btn" onclick="loadData()">🔄 Refresh</button>
-      <span class="source-info">Rollover — ${rvData.length} symbols</span>
+      <span class="source-info">${rvData.length} symbols · Near: ${expiries.near||'—'} → Mid: ${expiries.mid||'—'}</span>
     </div>
-    <div style="background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#aaa;">
-      📖 <b>Rolled%</b> = Mid OI ÷ (Near + Mid OI) × 100 &nbsp;|&nbsp;
-      <span style="color:#4caf50;">▶ &gt; 60% Bullish</span> (longs rolling forward) &nbsp;|&nbsp;
-      <span style="color:#ef5350;">▶ &lt; 20% Caution</span> (squaring off) &nbsp;|&nbsp;
+
+    <!-- Summary bar -->
+    <div style="display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+      <div style="background:#1a3a1a;border:1px solid #2a5a2a;border-radius:8px;padding:8px 14px;font-size:12px;">
+        <span style="color:#888;">High Rollover (&gt;60%)</span><br>
+        <span style="color:#4caf50;font-size:20px;font-weight:700;">${high}</span>
+        <span style="color:#888;font-size:11px;"> symbols</span>
+      </div>
+      <div style="background:#3a1a1a;border:1px solid #5a2a2a;border-radius:8px;padding:8px 14px;font-size:12px;">
+        <span style="color:#888;">Low Rollover (&lt;20%)</span><br>
+        <span style="color:#ef5350;font-size:20px;font-weight:700;">${low}</span>
+        <span style="color:#888;font-size:11px;"> symbols</span>
+      </div>
+      <div style="background:#1a2a3a;border:1px solid #2a4a5a;border-radius:8px;padding:8px 14px;font-size:12px;">
+        <span style="color:#888;">Avg Rolled%</span><br>
+        <span style="color:#4fc3f7;font-size:20px;font-weight:700;">${avgRolled}%</span>
+      </div>
+    </div>
+
+    <!-- Info banner -->
+    <div style="background:#16213e;border:1px solid #2a3a5a;border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:11px;color:#888;">
+      📖 <b>Rolled%</b> = Mid OI ÷ (Near + Mid) × 100 &nbsp;|&nbsp;
+      <span style="color:#4caf50;">▶ &gt;60% Bullish</span> (longs rolling forward) &nbsp;|&nbsp;
+      <span style="color:#ef5350;">▶ &lt;20% Caution</span> (squaring off) &nbsp;|&nbsp;
       <b>Roll Cost%</b> = Mid Basis% − Near Basis%
     </div>
+
+    <!-- Sort pills -->
+    <div class="filter-pills" id="rvSortFilter">
+      <span style="font-size:12px;color:#888;margin-right:4px;">Sort:</span>
+      <button class="filter-pill ${rvSort==='rolled_pct'?'active':''}" data-val="rolled_pct" onclick="setRvSort('rolled_pct')">Rolled% ↓</button>
+      <button class="filter-pill ${rvSort==='near_oi'?'active':''}"    data-val="near_oi"    onclick="setRvSort('near_oi')">Near OI ↓</button>
+      <button class="filter-pill ${rvSort==='mid_oi'?'active':''}"     data-val="mid_oi"     onclick="setRvSort('mid_oi')">Mid OI ↓</button>
+      <button class="filter-pill ${rvSort==='roll_cost'?'active':''}"  data-val="roll_cost"  onclick="setRvSort('roll_cost')">Roll Cost ↓</button>
+      <button class="filter-pill ${rvSort==='symbol'?'active':''}"     data-val="symbol"     onclick="setRvSort('symbol')">A-Z</button>
+    </div>
+
     <div class="table-scroll">
       <div class="table-wrap">
-        <div class="table-header" style="grid-template-columns: 100px 45px 55px 100px 95px 100px 95px 80px 90px 90px 90px 55px; min-width: 1000px;">
+        <div class="table-header" style="grid-template-columns: 105px 42px 50px 95px 85px 95px 85px 75px 85px 85px 85px 50px; min-width: 1020px;">
           <span>Symbol</span><span>Type</span><span>Lot</span><span>Near Exp</span><span>Near OI</span><span>Mid Exp</span><span>Mid OI</span><span>Rolled%</span><span>Roll Cost%</span><span>Near Basis%</span><span>Mid Basis%</span><span>Days</span>
         </div>
   `;
+
   if (rvData.length === 0) {
-    html += `<div class="empty" style="padding:20px;">No rollover data. Ensure rollover is in the snapshot JSON.</div>`;
+    html += `<div class="empty" style="padding:20px;">No rollover data in snapshot.</div>`;
   } else {
     rvData.forEach(item => {
       const rp = item.rolled_pct || 0;
-      const rpColor = rp > 60 ? '#4caf50' : rp < 20 ? '#ef5350' : '#b0b0c0';
-      const rpBold = (rp > 60 || rp < 20) ? 'font-weight:700;' : '';
-      const rollCostColor = (item.roll_cost_pct || 0) > 0.5 ? '#ef5350' : (item.roll_cost_pct || 0) < -0.5 ? '#4caf50' : '#b0b0c0';
+      const rpColor  = rp > 60 ? '#4caf50' : rp < 20 && item.mid_oi > 0 ? '#ef5350' : '#b0b0c0';
+      const rpBold   = (rp > 60 || (rp < 20 && item.mid_oi > 0)) ? 'font-weight:700;' : '';
+      const rcColor  = (item.roll_cost_pct || 0) > 0.3 ? '#ef5350' : (item.roll_cost_pct || 0) < -0.3 ? '#4caf50' : '#b0b0c0';
+      const nbClass  = (item.near_basis_pct || 0) >= 0 ? 'basis-pos' : 'basis-neg';
+      const mbClass  = (item.mid_basis_pct  || 0) >= 0 ? 'basis-pos' : 'basis-neg';
       html += `
-        <div class="table-row" style="grid-template-columns: 100px 45px 55px 100px 95px 100px 95px 80px 90px 90px 90px 55px; min-width: 1000px;">
+        <div class="table-row" style="grid-template-columns: 105px 42px 50px 95px 85px 95px 85px 75px 85px 85px 85px 50px; min-width: 1020px;">
           <span class="col-symbol">${item.symbol}</span>
           <span style="color:#888;font-size:11px;">${item.type}</span>
           <span style="color:#888;">${item.lot || '—'}</span>
-          <span style="font-size:12px;">${item.near_expiry}</span>
+          <span style="font-size:11px;color:#4fc3f7;">${item.near_expiry}</span>
           <span>${formatNumber(item.near_oi)}</span>
-          <span style="font-size:12px;">${item.mid_expiry || '—'}</span>
+          <span style="font-size:11px;color:#ffa726;">${item.mid_expiry || '—'}</span>
           <span>${item.mid_oi ? formatNumber(item.mid_oi) : '—'}</span>
           <span style="color:${rpColor};${rpBold}">${item.mid_oi ? rp.toFixed(1)+'%' : '—'}</span>
-          <span style="color:${rollCostColor};">${item.near_basis_pct ? (item.roll_cost_pct >= 0 ? '+' : '') + item.roll_cost_pct.toFixed(2) + '%' : '—'}</span>
-          <span class="${(item.near_basis_pct||0) >= 0 ? 'basis-pos' : 'basis-neg'}">${item.near_basis_pct ? item.near_basis_pct.toFixed(2)+'%' : '—'}</span>
-          <span class="${(item.mid_basis_pct||0) >= 0 ? 'basis-pos' : 'basis-neg'}">${item.mid_basis_pct ? item.mid_basis_pct.toFixed(2)+'%' : '—'}</span>
+          <span style="color:${rcColor};">${item.near_basis_pct ? (item.roll_cost_pct >= 0 ? '+' : '') + (item.roll_cost_pct||0).toFixed(2) + '%' : '—'}</span>
+          <span class="${nbClass}">${item.near_basis_pct ? item.near_basis_pct.toFixed(2)+'%' : '—'}</span>
+          <span class="${mbClass}">${item.mid_basis_pct && item.mid_oi ? item.mid_basis_pct.toFixed(2)+'%' : '—'}</span>
           <span style="color:#888;">${item.days_to_near}</span>
         </div>
       `;
@@ -1216,7 +1380,7 @@ function renderRollover(el) {
 // SYMBOL DETAIL MODAL
 // ============================================
 function showDetail(symbol) {
-  const item = appData.tracker.find(x => x.symbol === symbol);
+  const item = appData.allSymbolMap[symbol] || appData.tracker.find(x => x.symbol === symbol);
   if (!item) return;
 
   document.getElementById('modalSymbol').textContent = symbol;
@@ -1437,11 +1601,14 @@ function setFilter(filter) {
 }
 
 function filterTracker() {
-  const q = document.getElementById('searchBox').value.toLowerCase();
+  const q = document.getElementById('searchBox')?.value.toLowerCase() || '';
   document.querySelectorAll('.tracker-row').forEach(row => {
     const sym = row.getAttribute('data-symbol');
-    row.style.display = sym.includes(q) ? '' : 'none';
+    if (!sym.includes(q)) { row.style.display = 'none'; return; }
+    row.style.display = '';
   });
+  // Re-apply pill filters on top of search
+  applyTrackerFilters();
 }
 
 
